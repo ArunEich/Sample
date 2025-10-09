@@ -1,0 +1,58 @@
+# Python bytecode
+
+__pycache__/
+
+*.pyc
+
+*.pyo
+
+*.pyd
+ 
+ 
+# Virtual environment
+
+.venv/
+
+env/
+
+venv/
+
+ENV/
+ 
+# Environment variables
+
+.env
+ 
+# VSCode / IDE settings
+
+.vscode/
+
+.idea/
+ 
+# OS files
+
+.DS_Store
+
+Thumbs.db
+ 
+# Data / logs
+
+data/upload_logs.csv
+
+data/report_*.docx
+
+*.log
+ 
+# Temporary files
+
+*.tmp
+
+*.temp
+
+*.swp
+ 
+# Azure Functions local files
+
+local.settings.json
+
+ 
