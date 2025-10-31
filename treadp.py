@@ -394,3 +394,181 @@ async def run_audit(
         json.dump(results_data, f, indent=2)
 
     return JSONResponse(content={"status": "success", "file_id": file_id, "summary": summary})
+
+    ................................................................................................
+    #modified backend/utils/azure_clients.py
+    import time
+import random
+from openai import AzureOpenAIError
+
+MAX_RETRIES = 5  # you can adjust (3–5 recommended)
+RETRY_BASE_DELAY = 5  # seconds
+
+def safe_chat_completion_create(model, messages, temperature=0, max_tokens=200, client=None):
+    """
+    Wrapper for openai_client.chat.completions.create with retry handling.
+    Automatically retries when Azure rate limit (429) or transient network errors occur.
+    """
+    if client is None:
+        raise RuntimeError("Azure OpenAI client not initialized")
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            # Azure throttling errors usually contain code 429 or "RateLimitReached"
+            msg = str(e).lower()
+            if "ratelimit" in msg or "429" in msg or "quota" in msg:
+                wait_time = RETRY_BASE_DELAY * attempt + random.uniform(0, 2)
+                print(f"[Retry {attempt}/{MAX_RETRIES}] Rate limit hit. Waiting {wait_time:.1f}s before retry...")
+                time.sleep(wait_time)
+                continue
+            # transient network or timeout
+            if "timeout" in msg or "connection" in msg or "temporarily unavailable" in msg:
+                wait_time = RETRY_BASE_DELAY * attempt
+                print(f"[Retry {attempt}/{MAX_RETRIES}] Transient network error. Waiting {wait_time:.1f}s...")
+                time.sleep(wait_time)
+                continue
+
+            # other errors → don't retry
+            raise
+
+    raise RuntimeError(f"Failed after {MAX_RETRIES} retries due to persistent rate limit or network errors.")
+
+    ............................................................................................................
+    backend/core/ai_reviewer.py
+    import base64
+import traceback
+from backend.utils.azure_clients import openai_client, OPENAI_DEPLOYMENT, safe_chat_completion_create
+
+# ----------------------------
+# 1️⃣ - CLASSIFY RULE TYPE
+# ----------------------------
+def classify_rule_type(rule_text: str) -> str:
+    """
+    Classifies whether the audit checkpoint rule should be validated using Text Engine or Vision Engine.
+    """
+    try:
+        prompt = (
+            f"Decide if the following checkpoint should be validated using text-based analysis or visual-based analysis.\n"
+            f"Return only one word: 'Text' or 'Visual'.\n\nCheckpoint:\n{rule_text}"
+        )
+
+        response = safe_chat_completion_create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "You are a document audit rule classifier."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=10,
+            client=openai_client
+        )
+
+        result = response.choices[0].message.content.strip()
+        return "Visual" if "visual" in result.lower() else "Text"
+
+    except Exception as e:
+        print("❌ Error in classify_rule_type:", e)
+        traceback.print_exc()
+        return "Text"  # fallback to text-based if error
+
+
+# ----------------------------
+# 2️⃣ - TEXT ENGINE CHECK
+# ----------------------------
+def check_with_text_engine(rule: str, extracted_text: str) -> dict:
+    """
+    Validates text-based rules using Azure OpenAI GPT model.
+    """
+    try:
+        prompt = (
+            f"Checkpoint:\n{rule}\n\n"
+            f"Extracted Document Text:\n{extracted_text}\n\n"
+            "Evaluate whether the checkpoint criteria are satisfied within the document text. "
+            "Reply strictly in JSON with the following keys:\n"
+            "{\n"
+            "  'Status': 'Pass' or 'Fail',\n"
+            "  'Evidence': 'Brief evidence or reason',\n"
+            "  'Recommendation': 'Fix suggestion if failed'\n"
+            "}"
+        )
+
+        response = safe_chat_completion_create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": "You are a compliance document auditor focusing on text analysis."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=400,
+            client=openai_client
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+        print("❌ Error in check_with_text_engine:", e)
+        traceback.print_exc()
+        return {
+            "Status": "Fail",
+            "Evidence": "Error in text engine",
+            "Recommendation": str(e)
+        }
+
+
+# ----------------------------
+# 3️⃣ - VISION ENGINE CHECK
+# ----------------------------
+def check_with_vision_engine(rule: str, image_bytes: bytes) -> dict:
+    """
+    Validates visual-based rules using Azure OpenAI vision-enabled model.
+    """
+    try:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        base_prompt = (
+            f"Checkpoint:\n{rule}\n\n"
+            "Analyze the provided image to determine if the checkpoint is visually satisfied. "
+            "Return JSON output with these keys:\n"
+            "{\n"
+            "  'Status': 'Pass' or 'Fail',\n"
+            "  'Evidence': 'Brief evidence',\n"
+            "  'Recommendation': 'Fix suggestion if failed'\n"
+            "}"
+        )
+
+        response = safe_chat_completion_create(
+            model=OPENAI_DEPLOYMENT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": base_prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=400,
+            client=openai_client
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+        print("❌ Error in check_with_vision_engine:", e)
+        traceback.print_exc()
+        return {
+            "Status": "Fail",
+            "Evidence": "Error in vision engine",
+            "Recommendation": str(e)
+        }
+
+
+
