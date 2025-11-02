@@ -570,5 +570,176 @@ def check_with_vision_engine(rule: str, image_bytes: bytes) -> dict:
             "Recommendation": str(e)
         }
 
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# backend/core/ai_reviewer.py
+from backend.utils.azure_clients import openai_client, OPENAI_DEPLOYMENT
+import concurrent.futures
+import time
+
+def analyze_checkpoint_with_gpt(checkpoint: str, document_text: str) -> dict:
+    """
+    Use GPT-4o to verify if the checkpoint is satisfied in the given document text.
+    Returns dict with Status + Recommendation.
+    """
+    if openai_client is None:
+        return {"Status": "Fail", "Recommendation": "OpenAI client not configured"}
+
+    prompt = f"""
+You are an audit assistant.
+
+Below is the document content and a compliance checkpoint.
+Check if the checkpoint is satisfied in the document.
+
+Document:
+\"\"\"{document_text[:12000]}\"\"\"  # limit for context safety
+
+Checkpoint:
+"{checkpoint}"
+
+Respond in the format:
+Recommendation: <short summary of findings or missing information>
+Status: PASS or FAIL
+"""
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=200
+        )
+        content = response.choices[0].message.content.strip()
+
+        status = "Fail"
+        if "status: pass" in content.lower():
+            status = "Pass"
+        elif "status: fail" in content.lower():
+            status = "Fail"
+
+        # Extract recommendation part
+        recommendation = content.replace("Status:", "").replace("status:", "").strip()
+        return {"Status": status, "Recommendation": recommendation}
+
+    except Exception as e:
+        return {"Status": "Fail", "Recommendation": f"Error: {e}"}
+
+
+def parallel_analyze_checkpoints(checkpoints, document_text: str, max_workers: int = 5):
+    """
+    Run checkpoint verifications in parallel using ThreadPoolExecutor.
+    Handles rate limits gracefully by retrying.
+    """
+    results = []
+
+    def safe_analyze(cp):
+        retries = 3
+        for attempt in range(retries):
+            result = analyze_checkpoint_with_gpt(cp, document_text)
+            if "rate limit" in result["Recommendation"].lower():
+                time.sleep(2 ** attempt)
+                continue
+            return result
+        return {"Status": "Fail", "Recommendation": "Rate limit exceeded repeatedly"}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_cp = {executor.submit(safe_analyze, cp): cp for cp in checkpoints}
+        for future in concurrent.futures.as_completed(future_to_cp):
+            cp = future_to_cp[future]
+            try:
+                res = future.result()
+            except Exception as e:
+                res = {"Status": "Fail", "Recommendation": f"Error processing: {e}"}
+            results.append({"Checkpoint": cp, **res})
+
+    return results
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# backend/core/audit_logic.py
+from backend.core.ai_reviewer import parallel_analyze_checkpoints
+
+async def verify_checkpoints_with_ai(checkpoints, full_text: str, file_bytes: bytes, file_ext: str):
+    """
+    Simplified unified GPT-4o verification — no vision/text/hybrid separation.
+    Runs all checkpoints in parallel.
+    """
+    results = parallel_analyze_checkpoints(checkpoints, full_text, max_workers=5)
+
+    # Add serial number
+    for idx, r in enumerate(results, start=1):
+        r["S_No"] = idx
+
+    return results
+#>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# backend/routers/audit_router.py
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+import os, json
+from datetime import datetime
+
+from backend.core.logger import log_upload, init_log_file
+from backend.core.checkpoint_loader import load_checkpoints
+from backend.core.document_extractor import extract_pdf_content, extract_docx_content
+from backend.core.audit_logic import verify_checkpoints_with_ai
+from backend.core.report_generator import generate_report
+
+router = APIRouter(prefix="/audit", tags=["Audit"])
+
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+OUTPUT_DIR = os.path.join(os.getcwd(), "output")
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+@router.post("/run")
+async def run_audit(username: str = Form(...), file: UploadFile = File(...)):
+    if not file.filename.lower().endswith((".pdf", ".docx")):
+        raise HTTPException(status_code=400, detail="Only PDF and DOCX are supported")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_id = f"{username}_{timestamp}_{file.filename}"
+    upload_path = os.path.join(UPLOAD_DIR, file_id)
+    with open(upload_path, "wb") as f:
+        f.write(await file.read())
+
+    with open(upload_path, "rb") as f:
+        file_bytes = f.read()
+
+    ext = file.filename.lower().split(".")[-1]
+    if ext == "pdf":
+        full_text = extract_pdf_content(file_bytes)
+    else:
+        full_text = extract_docx_content(file_bytes)
+
+    checkpoints = load_checkpoints()
+    results = await verify_checkpoints_with_ai(checkpoints, full_text, file_bytes, ext)
+
+    pass_count = sum(1 for r in results if r["Status"] == "Pass")
+    fail_count = sum(1 for r in results if r["Status"] == "Fail")
+
+    summary = {
+        "total_checkpoints": len(checkpoints),
+        "passed": pass_count,
+        "failed": fail_count
+    }
+
+    report_buf = generate_report(file.filename, summary, results)
+    report_path = os.path.join(OUTPUT_DIR, f"report_{file_id}.docx")
+    with open(report_path, "wb") as f:
+        f.write(report_buf.getvalue())
+
+    init_log_file()
+    log_upload(username, file.filename)
+
+    results_data = {
+        "file_id": file_id,
+        "filename": file.filename,
+        "username": username,
+        "summary": summary,
+        "results": results,
+        "timestamp": datetime.now().isoformat()
+    }
+    with open(os.path.join(OUTPUT_DIR, f"results_{file_id}.json"), "w") as f:
+        json.dump(results_data, f, indent=2)
+
+    return JSONResponse(content={"status": "success", "file_id": file_id, "summary": summary})
+
 
 
