@@ -1,0 +1,86 @@
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - backend/*  
+variables:
+  - group: genaipocvariable
+stages:
+  - stage: Build
+    displayName: Build backend
+    jobs:
+      - job: BuildPython
+        displayName: Build Python Function App
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            displayName: Set Python Version $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+              #githubToken: $(github.token)
+              addToPath: true
+          - script: |
+              cd $(pythonProjectPath)
+              #python --version
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+            displayName: Install Python Dependencies
+          - task: ArchiveFiles@2
+            displayName: Archive Python Function Code
+            inputs:
+              rootFolderOrFile: $(pythonProjectPath)
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/python-function.zip
+              replaceExistingArchive: true
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Python Artifact
+            inputs:
+              PathtoPublish: $(Build.ArtifactStagingDirectory)/python-function.zip
+              ArtifactName: python-drop
+              publishLocation: Container
+  - stage: Deploy
+    displayName: Deploy to Azure
+    dependsOn: Build
+    jobs:           
+      - deployment: DeployPython
+        displayName: Deploy Python Function App
+        environment: sandbox
+        pool:
+          name: BD-IAC-Pool-Linux
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  displayName: Download Python Artifact
+                  inputs:
+                    buildType: current
+                    artifactName: python-drop
+                    downloadPath: $(Pipeline.Workspace)
+                - task: AzureCLI@2
+                  displayName: Deploy Python Function using Azure CLI
+                  inputs:
+                    azureSubscription: $(azureSubscription)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: >
+                      echo "Deploying Python Function App to $(functionAppName)"
+
+                      az functionapp deployment source config-zip --resource-group $(ResourceGroup) --name $(functionAppName) --src $(Pipeline.Workspace)/python-drop/python-function.zip --timeout 600
+
+                      echo "Waiting 30 seconds for function app to warm up..."
+
+                      sleep 30
+
+                      status=$(az functionapp show --name $(functionAppName) --resource-group $(ResourceGroup) --query "state" -o tsv)
+
+                      if [ "$status" = "Running" ]; then
+                        echo "✅ Function App deployment successful and running"
+                      else
+                        echo "❌ Function App status: $status"
+                        exit 1
+                      fi
